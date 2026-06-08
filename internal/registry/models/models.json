@@ -2178,5 +2178,73 @@
         ]
       }
     }
+  ],
+  "kiro": [
+    {
+      "id": "claude-sonnet-4-6",
+      "object": "model",
+      "created": 1752192000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude Sonnet 4.6 (Kiro)",
+      "description": "Claude Sonnet 4.6 via Kiro (AWS Amazon Q)",
+      "context_length": 200000,
+      "max_completion_tokens": 8192
+    },
+    {
+      "id": "claude-opus-4-7",
+      "object": "model",
+      "created": 1752192000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude Opus 4.7 (Kiro)",
+      "description": "Claude Opus 4.7 via Kiro (AWS Amazon Q)",
+      "context_length": 200000,
+      "max_completion_tokens": 8192
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "object": "model",
+      "created": 1752192000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude Haiku 4.5 (Kiro)",
+      "description": "Claude Haiku 4.5 via Kiro (AWS Amazon Q)",
+      "context_length": 200000,
+      "max_completion_tokens": 8192
+    },
+    {
+      "id": "claude-opus-4-6",
+      "object": "model",
+      "created": 1752192000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude Opus 4.6 (Kiro)",
+      "description": "Claude Opus 4.6 via Kiro (AWS Amazon Q)",
+      "context_length": 200000,
+      "max_completion_tokens": 8192
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "object": "model",
+      "created": 1752192000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude Sonnet 4.5 (Kiro)",
+      "description": "Claude Sonnet 4.5 via Kiro (AWS Amazon Q)",
+      "context_length": 200000,
+      "max_completion_tokens": 8192
+    },
+    {
+      "id": "claude-opus-4-5",
+      "object": "model",
+      "created": 1752192000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude Opus 4.5 (Kiro)",
+      "description": "Claude Opus 4.5 via Kiro (AWS Amazon Q)",
+      "context_length": 200000,
+      "max_completion_tokens": 8192
+    }
   ]
 }

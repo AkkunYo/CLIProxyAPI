@@ -22,11 +22,13 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
+	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -3127,6 +3129,98 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "wait"})
 }
 
+func (h *Handler) RequestKiroToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	fmt.Println("Initializing Kiro (Amazon Q) authentication...")
+
+	region := strings.TrimSpace(c.Query("region"))
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	deviceFlow, errStart := kiroauth.StartDeviceFlow(ctx, region)
+	if errStart != nil {
+		log.Errorf("Failed to start Kiro device flow: %v", errStart)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		return
+	}
+
+	authURL := deviceFlow.VerificationURIComplete
+	if authURL == "" {
+		authURL = deviceFlow.VerificationURI
+	}
+
+	state := fmt.Sprintf("kiro-%d", time.Now().UnixNano())
+	RegisterOAuthSession(state, "kiro")
+
+	go func() {
+		fmt.Printf("Waiting for authentication at %s...\n", authURL)
+		if deviceFlow.UserCode != "" {
+			fmt.Printf("User code: %s\n", deviceFlow.UserCode)
+		}
+
+		result, errWait := kiroauth.WaitForDeviceAuthorization(ctx, deviceFlow, region)
+		if errWait != nil {
+			SetOAuthSessionError(state, "Authentication failed")
+			fmt.Printf("Authentication failed: %v\n", errWait)
+			return
+		}
+
+		metadata := map[string]any{
+			"type":          "kiro",
+			"access_token":  result.AccessToken,
+			"refresh_token": result.RefreshToken,
+			"auth_method":   result.AuthMethod,
+			"region":        result.Region,
+			"timestamp":     time.Now().UnixMilli(),
+		}
+		if !result.ExpiresAt.IsZero() {
+			metadata["expired"] = result.ExpiresAt.Format(time.RFC3339)
+		}
+		if result.ProfileArn != "" {
+			metadata["profile_arn"] = result.ProfileArn
+		}
+		if result.ClientID != "" {
+			metadata["client_id"] = result.ClientID
+		}
+		if result.ClientSecret != "" {
+			metadata["client_secret"] = result.ClientSecret
+		}
+		if result.IDCRegion != "" {
+			metadata["idc_region"] = result.IDCRegion
+		}
+
+		fileName := fmt.Sprintf("kiro-%d.json", time.Now().UnixMilli())
+		label := "Kiro"
+		if result.AuthMethod == "builder-id" {
+			label = "AWS Builder ID"
+		}
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "kiro",
+			FileName: fileName,
+			Label:    label,
+			Metadata: metadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save Kiro authentication tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use Kiro (Amazon Q) services through this CLI")
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("kiro")
+	}()
+
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "user_code": deviceFlow.UserCode})
+}
+
 // PopulateAuthContext extracts request info and adds it to the context
 func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 	info := &coreauth.RequestInfo{
@@ -3134,4 +3228,152 @@ func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 		Headers: c.Request.Header,
 	}
 	return coreauth.WithRequestInfo(ctx, info)
+}
+
+// kiroUsageBaseURLs lists endpoints to try for getUsageLimits, in priority order.
+var kiroUsageBaseURLs = []string{
+	"https://q.us-east-1.amazonaws.com",
+	"https://codewhisperer.us-east-1.amazonaws.com",
+}
+
+// GetKiroUsage queries the Kiro /getUsageLimits endpoint for the given auth file.
+//
+// Query param: auth_index (required) — the auth_index from GET /auth-files.
+func (h *Handler) GetKiroUsage(c *gin.Context) {
+	authIndex := strings.TrimSpace(c.Query("auth_index"))
+	if authIndex == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
+		return
+	}
+
+	auth := h.authByIndex(authIndex)
+	if auth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth not found"})
+		return
+	}
+	if strings.TrimSpace(auth.Provider) != "kiro" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth is not a kiro credential"})
+		return
+	}
+
+	meta := auth.Metadata
+	if meta == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "kiro auth has no metadata"})
+		return
+	}
+
+	metaStr := func(key string) string {
+		v, _ := meta[key].(string)
+		return strings.TrimSpace(v)
+	}
+
+	key := &kiroauth.OAuthKey{
+		AccessToken:  metaStr("access_token"),
+		RefreshToken: metaStr("refresh_token"),
+		ExpiresAt:    metaStr("expires_at"),
+		AuthMethod:   metaStr("auth_method"),
+		Region:       metaStr("region"),
+		ClientID:     metaStr("client_id"),
+		ClientSecret: metaStr("client_secret"),
+		IDCRegion:    metaStr("idc_region"),
+		ProfileArn:   metaStr("profile_arn"),
+	}
+	if key.RefreshToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "kiro auth missing refresh_token"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	// Refresh to get a fresh access token and profileArn.
+	result, err := kiroauth.RefreshToken(ctx, key)
+	if err != nil {
+		log.WithError(err).Warn("kiro usage: token refresh failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "token refresh failed: " + err.Error()})
+		return
+	}
+
+	accessToken := result.AccessToken
+	profileArn := result.ProfileArn
+	isBuilderID := key.AuthMethod == "builder-id" || (key.ClientID != "" && key.ClientSecret != "")
+
+	machineID := func() string {
+		h := sha256.New()
+		h.Write([]byte(profileArn + "|" + key.ClientID))
+		return hex.EncodeToString(h.Sum(nil)[:16])
+	}()
+
+	transport := h.apiCallTransport(auth)
+	httpClient := &http.Client{Transport: transport, Timeout: 15 * time.Second}
+
+	kiroVersion := "0.11.63"
+	osName := runtime.GOOS
+	goVersion := strings.TrimPrefix(runtime.Version(), "go")
+
+	var lastStatus int
+	var lastBody []byte
+
+	for _, base := range kiroUsageBaseURLs {
+		usageURL := base + "/getUsageLimits"
+		params := "isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
+		if !isBuilderID && profileArn != "" {
+			params += "&profileArn=" + profileArn
+		}
+		fullURL := usageURL + "?" + params
+
+		req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+		if errReq != nil {
+			continue
+		}
+
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("x-amz-user-agent", fmt.Sprintf("aws-sdk-js/1.0.34 KiroIDE-%s-%s", kiroVersion, machineID))
+		req.Header.Set("User-Agent", fmt.Sprintf(
+			"aws-sdk-js/1.0.34 ua/2.1 os/%s lang/go md/go#%s api/codewhispererstreaming#1.0.34 m/E KiroIDE-%s-%s",
+			osName, goVersion, kiroVersion, machineID,
+		))
+		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=1")
+		req.Header.Set("x-amzn-codewhisperer-machine-id", machineID)
+		req.Header.Set("x-amzn-codewhisperer-optout", "true")
+		req.Header.Set("Connection", "close")
+
+		resp, errDo := httpClient.Do(req)
+		if errDo != nil {
+			log.WithError(errDo).Debugf("kiro usage: request to %s failed", base)
+			continue
+		}
+		body, errRead := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if errRead != nil {
+			continue
+		}
+		lastStatus = resp.StatusCode
+		lastBody = body
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
+	}
+
+	if lastBody == nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "all kiro endpoints failed"})
+		return
+	}
+
+	var payload any
+	if json.Unmarshal(lastBody, &payload) != nil {
+		payload = string(lastBody)
+	}
+
+	ok := lastStatus >= 200 && lastStatus < 300
+	resp := gin.H{
+		"success":         ok,
+		"upstream_status": lastStatus,
+		"data":            payload,
+	}
+	if !ok {
+		resp["message"] = fmt.Sprintf("upstream status: %d", lastStatus)
+	}
+	c.JSON(http.StatusOK, resp)
 }
